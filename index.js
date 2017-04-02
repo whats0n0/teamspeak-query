@@ -1,7 +1,7 @@
 'use strict';
 
 const net = require('net');
-const EventEmitter = require('eventemitter2');
+const EventEmitter = require('events');
 
 const type = require('type-of');
 const carrier = require('carrier');
@@ -22,22 +22,56 @@ class TeamspeakQuery extends EventEmitter {
 	constructor(host, port, options) {
 		super();
 
-		let sock = this.sock = new net.Socket(options || { });
-
-		this.queue = [ ];
-		this._current = null;
-		this._statusLines = 0;
+		this._options = options;
 
 		host = this.host = host || '127.0.0.1'
 		port = this.port = port || 10011;
 
 		this.throttle = new Throttle({ 'max': 10, 'per': 3000, 'enable': host !== '127.0.0.1' && host !== 'localhost' });
 
-		sock.connect(port, host);
+		this.connect();
+	}
+	/**
+	 * Connect to the server
+	 *
+	 * @return  {None} 
+	 *    
+	 */
+	connect(){
+		this.queue = this.queue || [];
+		this._current = this._current || null;
+		this._statusLines = this._statusLines || 0;
+		this.interval = null;
+
+		let sock = this.sock = new net.Socket(this._options || {});
+		sock.connect(this.port, this.host);
 
 		sock.on('connect', () => {
 			this.carrier = carrier.carry(sock);
 			this.carrier.on('line', this.handleLine.bind(this));
+
+			//Emit connect
+			this.emit('connect');
+
+			// Make sure session stays alive
+			this.interval = setInterval( () => {
+				this.send('help')
+					.then((data) => this.emit('ping'))
+					.catch((err) => console.log('Ping:', new Date, err));
+			}, 30000);
+		});
+
+		sock.on('error', (err) => {
+			console.log('Server socket error: ');
+			console.log(err);
+		});
+
+		sock.on('close', () => {
+			if(this.interval){
+				clearInterval(this.interval);
+			}
+			console.log('TeamspeakQuery: connection closed');
+			this.connect();
 		});
 	}
 
@@ -50,8 +84,9 @@ class TeamspeakQuery extends EventEmitter {
 	 */
 	send() {
 		let cmdString = TeamspeakQuery.assembleCommandString.apply({ }, Array.from(arguments)),
-			promise = new Promise((resolve, reject) =>
-			this.queue.push({ 'cmd': cmdString, resolve, reject }) );
+			promise = new Promise((resolve, reject) => {
+				this.queue.push({ 'cmd': cmdString, resolve, reject });
+			});
 
 		if(this._statusLines > 1) this.checkQueue();
 		return promise;
@@ -77,23 +112,34 @@ class TeamspeakQuery extends EventEmitter {
 	handleLine(line) {
 		if(this._statusLines < 2) {
 			this._statusLines++;
-			if(this._statusLines === 2) this.checkQueue();
+			if(this._statusLines === 2){
+				this.checkQueue();
+			}
 		} else {
 			line = line.trim();
 
 			let response = TeamspeakQuery.parse(line);
 
-			if(!response) return;
+			if(!response){
+				return;
+			}
 
-			if(response.type && response.type.indexOf('notify') === 0)
+			if(response.type && response.type.indexOf('notify') === 0){
 				this.emit(response.type.slice(6), response.params, line);
+			}
 			else if(response.type && response.type === 'error') {
-				if(response.params.id == 0) this._current.resolve(this._current.data || response.params);
-				else this._current.reject(response.params);
+				if(response.params.id == 0){
+					this._current.resolve(this._current.data || response.params);
+				}
+				else{
+					this._current.reject(response.params);
+				}
 
 				this._current = null;
-			} else if(this._current)
+			}
+			else if(this._current){
 				this._current.data = response.params;
+			}
 
 			this.checkQueue();
 		}
@@ -111,7 +157,7 @@ class TeamspeakQuery extends EventEmitter {
 
 		if(parsed) {
 			let resType = parsed[0].indexOf('=') === -1 ? parsed.shift() : null, // Only shift if the server responds with 'error' or 'notify'
-				params = { };
+				params = {};
 
 			parsed.forEach(v => {
 				let index = v.indexOf('='),
